@@ -49,6 +49,8 @@
 #include "serial.h"
 #include "can.h"
 //#include "MCP2515.h"
+#include "../../CAN_ID.h"	// Common CAN ID header 2 directories up from here
+#include "firmwareTable.h"
 
 /* USER CODE END Includes */
 
@@ -83,7 +85,9 @@ osSemaphoreId spiRxDirtyHandle;
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
-
+osMutexId nodeEntryMtxHandle[MAX_NODE_NUM];		// Mutex for every node table entry
+osTimerId nodeTmrHandle[MAX_NODE_NUM];			// Timer for each node's timeout timer
+nodeEntry nodeTable[MAX_NODE_NUM];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -112,6 +116,50 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
 		//MCP2515_EXTICallback();
 		break;
 	}
+}
+
+// Handler for node HB timeout
+void TmrHBTimeout(void const * argument){
+ 	uint8_t timerID = (uint8_t)pvTimerGetTimerID((TimerHandle_t)argument);
+
+	xSemaphoreTake(nodeEntryMtxHandle[timerID],portMAX_DELAY);
+	nodeTable[timerID].nodeConnectionState = UNRELIABLE;
+	xSemaphoreGive(nodeEntryMtxHandle[timerID]);
+	if((timerID) != mc_nodeID){
+		xQueueSend(badNodesHandle, argument,portMAX_DELAY);
+	}
+}
+
+void setupNodeTable(){
+	#ifdef cc_nodeID
+		nodeTable[cc_nodeID].nodeConnectionState = DISCONNECTED;
+		nodeTable[cc_nodeID].nodeFirmwareVersion = cc_VERSION;
+		nodeTable[cc_nodeID].nodeStatusWord = SW_Sentinel;
+	#endif
+
+	#ifdef mc_nodeID
+		nodeTable[mc_nodeID].nodeConnectionState = DISCONNECTED;
+		nodeTable[mc_nodeID].nodeFirmwareVersion = mc_VERSION;
+		nodeTable[mc_nodeID].nodeStatusWord = SW_Sentinel;
+	#endif
+
+	#ifdef bps_nodeID
+		nodeTable[bps_nodeID].nodeConnectionState = DISCONNECTED;
+		nodeTable[bps_nodeID].nodeFirmwareVersion = bps_VERSION;
+		nodeTable[bps_nodeID].nodeStatusWord = SW_Sentinel;
+	#endif
+
+	#ifdef ads_nodeID
+		nodeTable[ads_nodeID].nodeConnectionState = DISCONNECTED;
+		nodeTable[ads_nodeID].nodeFirmwareVersion = ads_VERSION;
+		nodeTable[ads_nodeID].nodeStatusWord = SW_Sentinel;
+	#endif
+
+	#ifdef radio_nodeID
+		nodeTable[radio_nodeID].nodeConnectionState = DISCONNECTED;
+		nodeTable[radio_nodeID].nodeFirmwareVersion = radio_VERSION;
+		nodeTable[radio_nodeID].nodeStatusWord = SW_Sentinel;
+	#endif
 }
 
 /* USER CODE END PFP */
@@ -143,18 +191,27 @@ int main(void)
   MX_WWDG_Init();
   MX_SPI1_Init();
   MX_ADC1_Init();
-
   /* USER CODE BEGIN 2 */
-
+#ifdef DEBUG
+	static uint8_t hbmsg[] = "Command Center booting... \n";
+	Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
+#endif
+  setupNodeTable();
   /* USER CODE END 2 */
 
   /* Create the mutex(es) */
   /* definition and creation of ctrlVarMtx */
+  // Driver control variable mutex
   osMutexDef(ctrlVarMtx);
   ctrlVarMtxHandle = osMutexCreate(osMutex(ctrlVarMtx));
 
   /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
+  	// Node table entry mutex
+	// Every entry has a mutex that is associated with the nodeID
+	for(uint8_t i =0; i < MAX_NODE_NUM; i++){
+	  osMutexDef(i);
+	  nodeEntryMtxHandle[i] = osMutexCreate(osMutex(i));
+	}
   /* USER CODE END RTOS_MUTEX */
 
   /* Create the semaphores(s) */
@@ -176,7 +233,17 @@ int main(void)
   HBTmrHandle = osTimerCreate(osTimer(HBTmr), osTimerPeriodic, NULL);
 
   /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
+  //Start the watchdog and heartbeat timers
+  osTimerStart(WWDGTmrHandle, WD_Interval);
+  osTimerStart(HBTmrHandle, CCMC_HB_Interval);
+  // Node heartbeat timeout timers
+  for(uint8_t TmrID = 0; TmrID < 6; TmrID++){
+	  osTimerDef(TmrID, TmrHBTimeout);
+	  nodeTmrHandle[TmrID] = osTimerCreate(osTimer(TmrID), osTimerOnce, TmrID);	// TmrID here is stored directly as a variable
+	  // One-shot timer since it should be refreshed by the Can Processor upon node HB reception
+	  osTimerStart(nodeTmrHandle[TmrID], CCMC_HB_Interval);
+  }
+
   /* USER CODE END RTOS_TIMERS */
 
   /* Create the thread(s) */
@@ -227,6 +294,7 @@ int main(void)
  
 
   /* Start scheduler */
+
   osKernelStart();
   
   /* We should never get here as control is now taken by the scheduler */
@@ -568,7 +636,9 @@ void doMotCanTx(void const * argument)
 void TmrKickDog(void const * argument)
 {
   /* USER CODE BEGIN TmrKickDog */
-  
+  taskENTER_CRITICAL();
+  HAL_WWDG_Refresh(&hwwdg);
+  taskEXIT_CRITICAL();
   /* USER CODE END TmrKickDog */
 }
 
@@ -576,7 +646,32 @@ void TmrKickDog(void const * argument)
 void TmrSendHB(void const * argument)
 {
   /* USER CODE BEGIN TmrSendHB */
-  
+	static Can_frame_t newFrame;
+
+	// Synchronously obtain the motor controller status
+	xSemaphoreTake(nodeEntryMtxHandle[mc_nodeID], portMAX_DELAY);
+	uint32_t motStatus = nodeTable[mc_nodeID].nodeStatusWord & 0x07;
+	xSemaphoreGive(nodeEntryMtxHandle[mc_nodeID]);
+
+	if((motStatus == ACTIVE) || (motStatus == SHUTDOWN)){
+		// Only send HB to MC if MC is in ACTIVE or SHUTDOWN state
+		newFrame.isExt = 0;
+		newFrame.isRemote = 0;
+		xSemaphoreTake(nodeEntryMtxHandle[cc_nodeID], portMAX_DELAY);
+		newFrame.core.id = cc_SW;
+		xSemaphoreGive(nodeEntryMtxHandle[cc_nodeID]);
+		newFrame.core.dlc = CAN_HB_DLC;
+		for(int i=0; i<4; i++){
+			newFrame.core.Data[3-i] = (nodeTable[cc_nodeID].nodeStatusWord >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
+		}
+
+#ifdef DEBUG
+	static uint8_t hbmsg[] = "CC->MC HB issued\n";
+	Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
+#endif
+
+		xQueueSendToFront(motCanTxBufHandle, &newFrame, 0);
+	}
   /* USER CODE END TmrSendHB */
 }
 

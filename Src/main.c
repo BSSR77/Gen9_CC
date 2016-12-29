@@ -74,11 +74,11 @@ osThreadId mainCan_TxHandle;
 osThreadId Can_ProcessorHandle;
 osThreadId Node_ManagerHandle;
 osThreadId motCan_TxHandle;
+osThreadId kickWatchdogHandle;
 osMessageQId mainCanTxBufHandle;
 osMessageQId mainCanRxBufHandle;
 osMessageQId motCanTxBufHandle;
 osMessageQId badNodesHandle;
-osTimerId WWDGTmrHandle;
 osTimerId HBTmrHandle;
 osMutexId ctrlVarMtxHandle;
 osSemaphoreId spiRxDirtyHandle;
@@ -105,7 +105,7 @@ void doCanTx(void const * argument);
 void doProcessCan(void const * argument);
 void doNodeManager(void const * argument);
 void doMotCanTx(void const * argument);
-void TmrKickDog(void const * argument);
+void doKickDog(void const * argument);
 void TmrSendHB(void const * argument);
 
 /* USER CODE BEGIN PFP */
@@ -121,7 +121,10 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
 // Handler for node HB timeout
 void TmrHBTimeout(void const * argument){
  	uint8_t timerID = (uint8_t)pvTimerGetTimerID((TimerHandle_t)argument);
-
+#ifdef DEBUG
+	static uint8_t hbmsg[] = "Timer Triggered... \n";
+	Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
+#endif
 	xSemaphoreTake(nodeEntryMtxHandle[timerID],portMAX_DELAY);
 	nodeTable[timerID].nodeConnectionState = UNRELIABLE;
 	xSemaphoreGive(nodeEntryMtxHandle[timerID]);
@@ -191,6 +194,7 @@ int main(void)
   MX_WWDG_Init();
   MX_SPI1_Init();
   MX_ADC1_Init();
+
   /* USER CODE BEGIN 2 */
 #ifdef DEBUG
 	static uint8_t hbmsg[] = "Command Center booting... \n";
@@ -201,7 +205,6 @@ int main(void)
 
   /* Create the mutex(es) */
   /* definition and creation of ctrlVarMtx */
-  // Driver control variable mutex
   osMutexDef(ctrlVarMtx);
   ctrlVarMtxHandle = osMutexCreate(osMutex(ctrlVarMtx));
 
@@ -224,20 +227,15 @@ int main(void)
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* Create the timer(s) */
-  /* definition and creation of WWDGTmr */
-  osTimerDef(WWDGTmr, TmrKickDog);
-  WWDGTmrHandle = osTimerCreate(osTimer(WWDGTmr), osTimerPeriodic, NULL);
-
   /* definition and creation of HBTmr */
   osTimerDef(HBTmr, TmrSendHB);
   HBTmrHandle = osTimerCreate(osTimer(HBTmr), osTimerPeriodic, NULL);
 
   /* USER CODE BEGIN RTOS_TIMERS */
   //Start the watchdog and heartbeat timers
-  osTimerStart(WWDGTmrHandle, WD_Interval);
   osTimerStart(HBTmrHandle, CCMC_HB_Interval);
   // Node heartbeat timeout timers
-  for(uint8_t TmrID = 0; TmrID < 6; TmrID++){
+  for(uint8_t TmrID = 0; TmrID < MAX_NODE_NUM; TmrID++){
 	  osTimerDef(TmrID, TmrHBTimeout);
 	  nodeTmrHandle[TmrID] = osTimerCreate(osTimer(TmrID), osTimerOnce, TmrID);	// TmrID here is stored directly as a variable
 	  // One-shot timer since it should be refreshed by the Can Processor upon node HB reception
@@ -267,6 +265,10 @@ int main(void)
   osThreadDef(motCan_Tx, doMotCanTx, osPriorityHigh, 0, 512);
   motCan_TxHandle = osThreadCreate(osThread(motCan_Tx), NULL);
 
+  /* definition and creation of kickWatchdog */
+  osThreadDef(kickWatchdog, doKickDog, osPriorityRealtime, 0, 256);
+  kickWatchdogHandle = osThreadCreate(osThread(kickWatchdog), NULL);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
@@ -294,7 +296,6 @@ int main(void)
  
 
   /* Start scheduler */
-
   osKernelStart();
   
   /* We should never get here as control is now taken by the scheduler */
@@ -632,14 +633,21 @@ void doMotCanTx(void const * argument)
   /* USER CODE END doMotCanTx */
 }
 
-/* TmrKickDog function */
-void TmrKickDog(void const * argument)
+/* doKickDog function */
+void doKickDog(void const * argument)
 {
-  /* USER CODE BEGIN TmrKickDog */
-  taskENTER_CRITICAL();
-  HAL_WWDG_Refresh(&hwwdg);
-  taskEXIT_CRITICAL();
-  /* USER CODE END TmrKickDog */
+  /* USER CODE BEGIN doKickDog */
+  /* Infinite loop */
+  TickType_t xLastWakeTime = xTaskGetTickCount ();
+  for(;;)
+  {
+	taskENTER_CRITICAL();
+	HAL_WWDG_Refresh(&hwwdg);
+	taskEXIT_CRITICAL();
+
+	vTaskDelayUntil(&xLastWakeTime, WD_Interval);
+  }
+  /* USER CODE END doKickDog */
 }
 
 /* TmrSendHB function */
