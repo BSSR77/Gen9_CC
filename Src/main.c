@@ -584,14 +584,25 @@ void doRealTime(void const * argument)
   /* USER CODE END 5 */ 
 }
 
-/* doCanTx function */
+/* doCanTx function
+ * Main CAN transmission function via MCP2515
+ * */
 void doCanTx(void const * argument)
 {
   /* USER CODE BEGIN doCanTx */
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+	  static Can_frame_t newFrame;
+	  xQueueReceive(mainCanTxBufHandle, &newFrame, portMAX_DELAY);	// Only process CAN Transmissions when the queue is non-empty
+
+	  if (((nodeTable[cc_nodeID].nodeStatusWord & 0x07) == ACTIVE)){
+		  // Only attempt transmission if CC is in ACTIVE mode
+		  while(0/* TODO: mainCAN available */){	// Wait if MCP2515 module is still busy
+			  osDelay(mainCanTxInterval);
+		  }
+		  // TODO: mainCAN send
+	  }
   }
   /* USER CODE END doCanTx */
 }
@@ -620,14 +631,28 @@ void doNodeManager(void const * argument)
   /* USER CODE END doNodeManager */
 }
 
-/* doMotCanTx function */
+/* doMotCanTx function
+ * send data to the motor CAN via STM32 bxCAN
+ * */
 void doMotCanTx(void const * argument)
 {
   /* USER CODE BEGIN doMotCanTx */
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+	  static Can_frame_t newFrame;
+	  xQueueReceive(motCanTxBufHandle, &newFrame, portMAX_DELAY);	// Only process CAN Transmissions when the queue is non-empty
+	  uint32_t motStatus = nodeTable[mc_nodeID].nodeStatusWord & 0x07;
+
+	  // TODO: May have to check the tx states for motor controller
+	  if (((motStatus & 0x07) == ACTIVE) || ((motStatus & 0x07) == SHUTDOWN)){
+		  // Only send to motor controller if it is ACTIVE or in SHUTDOWN mode
+		  while(Can_availableForTx() == 0){	// Wait if bxCAN module is still busy
+			  osDelay(motCanTxInterval);
+		  }
+
+		  Can_sendStd(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
+	  }
   }
   /* USER CODE END doMotCanTx */
 }
@@ -654,11 +679,7 @@ void TmrSendHB(void const * argument)
 {
   /* USER CODE BEGIN TmrSendHB */
 	static Can_frame_t newFrame;
-
-	// Synchronously obtain the motor controller status
-	xSemaphoreTake(nodeEntryMtxHandle[mc_nodeID], portMAX_DELAY);
 	uint32_t motStatus = nodeTable[mc_nodeID].nodeStatusWord & 0x07;
-	xSemaphoreGive(nodeEntryMtxHandle[mc_nodeID]);
 
 	if((motStatus == ACTIVE) || (motStatus == SHUTDOWN)){
 		// Only send HB to MC if MC is in ACTIVE or SHUTDOWN state
