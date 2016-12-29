@@ -48,7 +48,7 @@
 /* USER CODE BEGIN Includes */
 #include "serial.h"
 #include "can.h"
-#include "MCP2515.h"
+//#include "MCP2515.h"
 
 /* USER CODE END Includes */
 
@@ -109,7 +109,7 @@ void TmrSendHB(void const * argument);
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
 	switch(GPIO_Pin){
 	case MCP_Int_Pin:
-		MCP2515_EXTICallback();
+		//MCP2515_EXTICallback();
 		break;
 	}
 }
