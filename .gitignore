@@ -6,3 +6,8 @@ Src/Backup
 
 Release/
 
+
+Inc/Backup/*.*
+Inc/Backup/FreeRTOSConfig.h.bak
+
+Inc/Backup/main.h.bak

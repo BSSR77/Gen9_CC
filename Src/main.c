@@ -122,12 +122,11 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
 void TmrHBTimeout(void const * argument){
  	uint8_t timerID = (uint8_t)pvTimerGetTimerID((TimerHandle_t)argument);
 #ifdef DEBUG
-	static uint8_t hbmsg[] = "Timer Triggered... \n";
-	Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
+	Serial2_writeBytes("Timer ",6);
+	Serial2_write(timerID);
+	Serial2_writeBytes(" triggered!\n",12);
 #endif
-	xSemaphoreTake(nodeEntryMtxHandle[timerID],portMAX_DELAY);
 	nodeTable[timerID].nodeConnectionState = UNRELIABLE;
-	xSemaphoreGive(nodeEntryMtxHandle[timerID]);
 	if((timerID) != mc_nodeID){
 		xQueueSend(badNodesHandle, argument,portMAX_DELAY);
 	}
@@ -239,8 +238,8 @@ int main(void)
 	  osTimerDef(TmrID, TmrHBTimeout);
 	  nodeTmrHandle[TmrID] = osTimerCreate(osTimer(TmrID), osTimerOnce, TmrID);	// TmrID here is stored directly as a variable
 	  // One-shot timer since it should be refreshed by the Can Processor upon node HB reception
-	  osTimerStart(nodeTmrHandle[TmrID], CCMC_HB_Interval);
   }
+
 
   /* USER CODE END RTOS_TIMERS */
 
@@ -287,7 +286,7 @@ int main(void)
   motCanTxBufHandle = osMessageCreate(osMessageQ(motCanTxBuf), NULL);
 
   /* definition and creation of badNodes */
-  osMessageQDef(badNodes, 4, uint8_t);
+  osMessageQDef(badNodes, 16, uint8_t);
   badNodesHandle = osMessageCreate(osMessageQ(badNodes), NULL);
 
   /* USER CODE BEGIN RTOS_QUEUES */
@@ -580,7 +579,7 @@ void doRealTime(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+	osDelay(1);
   }
   /* USER CODE END 5 */ 
 }

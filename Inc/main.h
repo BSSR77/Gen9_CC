@@ -75,7 +75,7 @@
 #define MAX_NODE_NUM 16		// Maximum number of nodes supported on this system
 
 #define WD_Interval			16		// Watchdog reset interval (ticks)
-#define CCMC_HB_Interval	1000	// CC -> MC Heartbeat interval (ticks)
+#define CCMC_HB_Interval	2000	// CC -> MC Heartbeat interval (ticks)
 // The node entry does not need a nodeID since it will be stored in an array with nodeID as key
 typedef struct {
 	uint8_t	 nodeConnectionState;
