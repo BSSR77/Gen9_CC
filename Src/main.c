@@ -119,45 +119,30 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
 	}
 }
 
+static inline void shutdownMotor(){
+	static Can_frame_t offFrame;
+	// Switch positions to indicate motor neutral
+	offFrame.isExt = 0;
+	offFrame.isRemote = 0;
+	offFrame.core.id = mc_P2P;
+	offFrame.core.dlc = CMD_DLC;
+	offFrame.core.Data[0] = NODE_SHUTDOWN;
+	while(Can_availableForTx() == 0){	// Wait if bxCAN module is still busy
+	  osDelay(motCanTxInterval);
+	}
+	Can_sendStd(offFrame.core.id,offFrame.isRemote,offFrame.core.Data,offFrame.core.dlc);
+}
+
 static inline void shutdown_routine(){
 	// Don't care about locking the statusWord here since we are in Critical Area
 	nodeTable[cc_nodeID].nodeStatusWord &= 0xfffffff8;	// Clear the node status field
 	nodeTable[cc_nodeID].nodeStatusWord |= SHUTDOWN;		// Set status to shutdown
 
-	// Send status word indicating node shutdown to CC
+	// Put motor into SHUTDOWN state
+	shutdownMotor();
+
+	// Broadcast CC shutdown state to main CAN
 	static Can_frame_t newFrame;
-	// Switch positions to indicate motor neutral
-	newFrame.isExt = 0;
-	newFrame.isRemote = 0;
-	newFrame.core.id = swPos;
-	newFrame.core.dlc = swPos_DLC;
-	// TODO: fill in switch data
-	while(Can_availableForTx() == 0){	// Wait if bxCAN module is still busy
-	  osDelay(motCanTxInterval);
-	}
-	Can_sendStd(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
-
-	// Send frame to motor CAN to set throttle to 0.0
-	newFrame.core.id = accelPos;
-	newFrame.core.dlc = accelPos_DLC;
-	for(uint i = 0 ; i < 4; i++){
-		newFrame.core.Data[i] = 0;	// float -> 0.0
-	}
-	while(Can_availableForTx() == 0){	// Wait if bxCAN module is still busy
-	  osDelay(motCanTxInterval);
-	}
-	Can_sendStd(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
-
-	// Send frame to motor CAN to set regen to 0.0
-	newFrame.core.id = regenPos;
-	newFrame.core.dlc = regenPos_DLC;
-	// Data is same as above -> float 0.0
-	while(Can_availableForTx() == 0){	// Wait if bxCAN module is still busy
-	  osDelay(motCanTxInterval);
-	}
-	Can_sendStd(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
-
-	// Broadcast CC shutdown to main CAN
 	newFrame.core.id = radio_SW;
 	newFrame.core.dlc = CAN_HB_DLC;
 	for(int i=0; i<4; i++){
@@ -177,44 +162,64 @@ static inline void shutdown_routine(){
 	}
 }
 
+void node_hreset(){
+#ifdef DEBUG
+	static uint8_t msg[] = "Node hard reset issued\n";
+	Serial2_writeBytes(msg, sizeof(msg)-1);
+#endif
+	NVIC_SystemReset();					// CMSIS System reset function
+}
+
+void node_reset(){
+#ifdef DEBUG
+	static uint8_t msg[] = "Node reset issued\n";
+	Serial2_writeBytes(msg, sizeof(msg)-1);
+#endif
+	shutdown_routine();
+	NVIC_SystemReset();					// CMSIS System reset function
+}
+
+void node_shutdown(){
+	shutdown_routine();	// in shutdown state, CC will continue MC heartbeat
+	// Shutdown all active timers
+	for(uint8_t i = 0 ; i < MAX_NODE_NUM;i++){
+		xTimerStop(nodeTmrHandle[i], portMAX_DELAY);
+	}
+}
+
+void node_start(){
+	// first send to all main nodes RESET command
+	static Can_frame_t resetCmd;
+	resetCmd.isExt = 0;
+	resetCmd.isRemote = 0;
+	resetCmd.core.dlc = CMD_DLC;
+	for(uint8_t i = 0 ; i < MAX_NODE_NUM;i++){
+		if(nodeTable[i].nodeFirmwareVersion != SW_Sentinel){
+			resetCmd.core.id = i + p2pOffset;
+			resetCmd.core.Data[0] = NODE_RESET;
+			xQueueSend(mainCanTxBufHandle, &resetCmd, portMAX_DELAY);
+		}
+	}
+	// Reset the badNodes queue since a fresh reset has been issued
+	xQueueReset(badNodesHandle);
+}
+
 void executeCommand(nodeCommands cmd){
 	taskENTER_CRITICAL();
-	static Can_frame_t resetCmd;
-	static uint8_t msg[] = "Node hard reset issued\n";
 	switch(cmd){
 	case(NODE_HRESET):
-	#ifdef DEBUG
-		Serial2_writeBytes(msg, sizeof(msg)-1);
-	#endif
-		NVIC_SystemReset();					// CMSIS System reset function
+		node_hreset();
 		break;
 	case(NODE_RESET):
-		shutdown_routine();
-		NVIC_SystemReset();
+		node_reset();
 		break;
 
 	case(NODE_SHUTDOWN):
-		shutdown_routine();	// in shutdown state, CC will continue MC heartbeat
-		// Shutdown all active timers
-		for(uint8_t i = 0 ; i < MAX_NODE_NUM;i++){
-			xTimerStop(nodeTmrHandle[i], portMAX_DELAY);
-		}
+		node_shutdown();
 		break;
 
 	case(NODE_START):
-		// first send to all main nodes RESET command
-		resetCmd.isExt = 0;
-		resetCmd.isRemote = 0;
-		resetCmd.core.dlc = CMD_DLC;
-		for(uint8_t i = 0 ; i < MAX_NODE_NUM;i++){
-			if(nodeTable[i].nodeFirmwareVersion != SW_Sentinel){
-				resetCmd.core.id = i + p2pOffset;
-				resetCmd.core.Data[0] = NODE_RESET;
-				xQueueSend(mainCanTxBufHandle, &resetCmd, portMAX_DELAY);
-			}
-		}
-		// Reset the badNodes queue since a fresh reset has been issued
-		xQueueReset(badNodesHandle);
+		node_start();
 		break;
 
 	default:
@@ -268,6 +273,41 @@ void setupNodeTable(){
 		nodeTable[radio_nodeID].nodeConnectionState = DISCONNECTED;
 		nodeTable[radio_nodeID].nodeFirmwareVersion = radio_VERSION;
 	#endif
+}
+
+/*
+ * Main Can Receive Callback
+ */
+void mainCanRxCallback(){
+	static Can_frame_core_t newCore;
+
+	// TODO: Load newCore with received frame
+
+	// Check if it's anything critical
+	taskENTER_CRITICAL();
+	switch(newCore.id){
+	case (SysEMSD):
+		// Ensure motor is shutdown, CC remains ACTIVE for diagnostics
+		shutdownMotor();
+		break;
+
+	case (UsrEMSD):
+		// Ensure motor is shutdown, CC remains ACTIVE for diagnostics
+		shutdownMotor();
+		break;
+
+	case (p2pOffset):
+		// CAN ID is a P2P broadcast -> command
+		executeCommand((nodeCommands)newCore.Data);	// Byte length command, no need to put into uint32_t form
+		break;
+
+	case (cc_P2P):
+		// CAN ID is a P2P ID -> command
+		executeCommand((nodeCommands)newCore.Data);	// Byte length command, no need to put into uint32_t form
+		break;
+	}
+	taskEXIT_CRITICAL();
+	xQueueSend(mainCanRxBufHandle, &newCore, portMAX_DELAY);	// Send the new data to the mainCanRxBuf queue
 }
 
 /*
@@ -782,18 +822,31 @@ void doRealTime(void const * argument)
    * Push variables to motCanTxBuf
    * */
   uint32_t PreviousTickTime = osKernelSysTick();
+  uint16_t delayTickMarker = osKernelSysTick();	// Counts how many ticks elapsed at least before sending message to main CAN
 
   for(;;)
   {
-	// Switch positions are sent in their individual GPIO interrupts!
+	// ALL CRITICAL MOTOR CONTROLS SHOULD BE TOGGLE SWITCHES; NO PUSH BUTTONS!
 	xSemaphoreTake(ctrlVarMtxHandle,portMAX_DELAY);
 	// TODO: Read ADC values, and update userInputs struct
 	xSemaphoreGive(ctrlVarMtxHandle);
 
-	// Assemble Brake Position frame
+	uint32_t currentTickTime = osKernelSysTick();
+	// Assemble Switch Position frame
 	static Can_frame_t newFrame;
 	newFrame.isExt = 0;
 	newFrame.isRemote = 0;
+	newFrame.core.id = swPos;
+	newFrame.core.dlc = swPos_DLC;
+	// TODO: assemble switch position data
+
+	if(currentTickTime - delayTickMarker >= ctrlVarTxInterval){
+		// TODO: Send to mainCAN
+	}
+
+	xQueueSend(motCanTxBufHandle, &newFrame, 0);
+
+	// Assemble Brake Position frame
 	newFrame.core.id = brakePos;
 	newFrame.core.dlc = brakePos_DLC;
 	for(int i=0; i<4; i++){
@@ -804,29 +857,31 @@ void doRealTime(void const * argument)
 	xQueueSend(motCanTxBufHandle, &newFrame, 0);
 
 	// Assemble Accelerator Position frame
-	newFrame.isExt = 0;
-	newFrame.isRemote = 0;
 	newFrame.core.id = accelPos;
 	newFrame.core.dlc = accelPos_DLC;
 	for(int i=0; i<4; i++){
 		newFrame.core.Data[3-i] = ((uint32_t)(userInput.accelPosition) >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
 	}
 
-	// TODO: Send to mainCAN
+	if(currentTickTime - delayTickMarker >= ctrlVarTxInterval){
+		// TODO: Send to mainCAN
+	}
 	xQueueSend(motCanTxBufHandle, &newFrame, 0);
 
 	// Assemble Regen Position frame
-	newFrame.isExt = 0;
-	newFrame.isRemote = 0;
 	newFrame.core.id = regenPos;
 	newFrame.core.dlc = regenPos_DLC;
 	for(int i=0; i<4; i++){
 		newFrame.core.Data[3-i] = ((uint32_t)(userInput.regenPosition) >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
 	}
 
-	// TODO: Send to mainCAN
+	if(currentTickTime - delayTickMarker >= ctrlVarTxInterval){
+		// TODO: Send to mainCAN
+		delayTickMarker = osKernelSysTick();		// Only reset at the very end to ensure that all 3 variables are sent synchronously
+	}
 	xQueueSend(motCanTxBufHandle, &newFrame, 0);
 
+	// Periodic function
 	osDelayUntil(&PreviousTickTime, RT_Interval);
   }
   /* USER CODE END 5 */ 
@@ -868,11 +923,6 @@ void doProcessCan(void const * argument)
 	uint8_t nodeID = canID & 0x00F;		// nodeID container
 
 	// CAN ID group processing
-	if(canID == p2pOffset){
-		// CAN ID is a P2P ID -> command
-		executeCommand((nodeCommands)newFrame.core.Data);	// Byte length command, no need to put into uint32_t form
-	}
-
 	if((nodeTable[cc_nodeID].nodeStatusWord & 0x07) == ACTIVE){
 		// Only respond if node is active
 		uint32_t temp_data = 0;				// Temporary data container
@@ -960,6 +1010,7 @@ void doProcessCan(void const * argument)
 			}
 			xQueueSend(mainCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
 		}
+		/*
 		else {
 			// Individual CAN ID Processing
 			switch(canID){
@@ -969,6 +1020,7 @@ void doProcessCan(void const * argument)
 					break;
 			}
 		}
+		*/
 	}
   }
   /* USER CODE END doProcessCan */

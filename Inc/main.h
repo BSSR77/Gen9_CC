@@ -82,6 +82,8 @@
 #define motCanTxInterval	1		// Motor CAN transmission interval (ticks)
 #define mainCanTxInterval	1		// Main CAN transmission interval (ticks)
 
+#define ctrlVarTxInterval	500		// Control variable main CAN transmission interval (ticks)
+
 // The node entry does not need a nodeID since it will be stored in an array with nodeID as key
 typedef struct {
 	uint8_t	 nodeConnectionState;
