@@ -130,7 +130,7 @@ void TmrHBTimeout(void const * argument){
 #endif
 	nodeTable[timerID].nodeConnectionState = UNRELIABLE;
 	if((timerID) != mc_nodeID){
-		xQueueSend(badNodesHandle, argument,portMAX_DELAY);
+		xQueueSend(badNodesHandle, &timerID, portMAX_DELAY);
 	}
 }
 
@@ -207,7 +207,7 @@ void motCanRxCallback(){
  */
 void resetNode(resetParams * passed){
 	if(passed->attempts == 0){
-		// Send RESET command to node
+		// TODO: Send RESET command to node
 		osDelayUntil(&(passed->ticks), HB_Interval);
 		if((nodeTable[passed->nodeID].nodeConnectionState & 0x07) == UNRELIABLE){
 			passed->attempts = passed->attempts+1;
@@ -215,6 +215,11 @@ void resetNode(resetParams * passed){
 		}
 		else{
 			// Recovery successful
+#ifdef DEBUG
+	Serial2_write(passed->nodeID);
+	static uint8_t hbmsg[] = "Node reset success... \n";
+	Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
+#endif
 			vTaskDelete(NULL);
 		}
 	}
@@ -222,8 +227,16 @@ void resetNode(resetParams * passed){
 		// Recovery failed, set node to Hard Error!
 		xSemaphoreTake(nodeEntryMtxHandle[passed->nodeID], portMAX_DELAY);
 		nodeTable[passed->nodeID].nodeConnectionState = HARD_ERROR;
-		xSemaphoreTake(nodeEntryMtxHandle[passed->nodeID], portMAX_DELAY);
+		xSemaphoreGive(nodeEntryMtxHandle[passed->nodeID]);
+#ifdef DEBUG
+	Serial2_write(passed->nodeID);
+	static uint8_t hbmsg[] = "Node reset failure... \n";
+	Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
+#endif
 		vTaskDelete(NULL);
+	} else {
+		passed->attempts = passed->attempts+1;
+		resetNode(passed);	// Retry
 	}
 }
 
@@ -742,13 +755,12 @@ void doNodeManager(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-	uint8_t badNodeID;
+	uint8_t badNodeID = 0xFF;
 	xQueueReceive(badNodesHandle, &badNodeID, portMAX_DELAY);
 	resetParams toPass;
 	toPass.nodeID = badNodeID;
 	toPass.attempts = 0;
 	toPass.ticks = osKernelSysTick();
-	//TODO: Test whether ther struct has been successfully passed in or not
 	xTaskCreate(resetNode, (const char*)"", 512, (void *)(&toPass), uxTaskPriorityGet(NULL),NULL);
   }
   /* USER CODE END doNodeManager */
