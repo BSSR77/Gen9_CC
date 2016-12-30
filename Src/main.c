@@ -148,7 +148,7 @@ static inline void shutdown_routine(){
 	for(int i=0; i<4; i++){
 		newFrame.core.Data[3-i] = (nodeTable[cc_nodeID].nodeStatusWord >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
 	}
-	xQueueSendFromISR(mainCanTxBufHandle, &newFrame, pdFALSE);
+	//XXX xQueueSendFromISR(mainCanTxBufHandle, &newFrame, pdFALSE);
 	HAL_Delay(1);	// 1ms delay to ensure the queue is properly updated before proceeding
 
 	// Loop through Main CAN Tx buffer to send any pending messages
@@ -197,7 +197,7 @@ void node_start(){
 		if(nodeTable[i].nodeFirmwareVersion != SW_Sentinel){
 			resetCmd.core.id = i + p2pOffset;
 			resetCmd.core.Data[0] = NODE_RESET;
-			xQueueSend(mainCanTxBufHandle, &resetCmd, portMAX_DELAY);
+			//XXX xQueueSend(mainCanTxBufHandle, &resetCmd, portMAX_DELAY);
 		}
 	}
 	// Reset the badNodes queue since a fresh reset has been issued
@@ -352,7 +352,7 @@ void motCanRxCallback(){
 	}
 
 	// XXX: Any data to additional application layer tasks should be buffered with Queues
-	xQueueSendFromISR(mainCanTxBufHandle, &newCore, pdFALSE);	// Push the data onto main CAN for radio
+	//xQueueSendFromISR(mainCanTxBufHandle, &newCore, pdFALSE);	// Push the data onto main CAN for radio
 }
 
 /*
@@ -372,7 +372,7 @@ void resetNode(resetParams * passed){
 		else{
 			newFrame.core.Data[0] = NODE_HRESET;	// Second attempt and beyond - hard reset
 		}
-		xQueueSend(mainCanTxBufHandle, &newFrame, portMAX_DELAY);
+		//XXX xQueueSend(mainCanTxBufHandle, &newFrame, portMAX_DELAY);
 		osDelayUntil(&(passed->ticks), HB_Interval);
 		if((nodeTable[passed->nodeID].nodeConnectionState & 0x07) == UNRELIABLE){
 			passed->attempts = passed->attempts+1;
@@ -481,12 +481,14 @@ int main(void)
   /* definition and creation of HBTmr */
   osTimerDef(HBTmr, TmrSendHB);
   HBTmrHandle = osTimerCreate(osTimer(HBTmr), osTimerPeriodic, NULL);
+  xTimerChangePeriod(HBTmrHandle, CCMC_HB_Interval, portMAX_DELAY);
 
   /* USER CODE BEGIN RTOS_TIMERS */
   // Node heartbeat timeout timers
   for(uint8_t TmrID = 0; TmrID < MAX_NODE_NUM; TmrID++){
 	  osTimerDef(TmrID, TmrHBTimeout);
 	  nodeTmrHandle[TmrID] = osTimerCreate(osTimer(TmrID), osTimerOnce, TmrID);	// TmrID here is stored directly as a variable
+	  xTimerChangePeriod(HBTmrHandle, HB_Interval, portMAX_DELAY);
 	  // One-shot timer since it should be refreshed by the Can Processor upon node HB reception
   }
 
@@ -952,7 +954,7 @@ void doProcessCan(void const * argument)
 				shutdownCMD.core.id = nodeID + p2pOffset;
 				shutdownCMD.core.dlc = CMD_DLC;
 				shutdownCMD.core.Data[0] = NODE_SHUTDOWN;
-				xQueueSend(mainCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
+				//XXX xQueueSend(mainCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
 				break;
 			}
 			// CAN ID is a status word address
@@ -983,8 +985,7 @@ void doProcessCan(void const * argument)
 			}
 			else{
 				xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
-				nodeTable[nodeID].nodeStatusWord &= 0xFFFFFFF8;
-				nodeTable[nodeID].nodeStatusWord |= UNRELIABLE;
+				nodeTable[nodeID].nodeConnectionState = UNRELIABLE;
 				xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
 				xQueueSend(badNodesHandle, &nodeID, portMAX_DELAY);
 			}
@@ -1007,16 +1008,14 @@ void doProcessCan(void const * argument)
 				// Firmware version accepted
 				shutdownCMD.core.Data[0] = CC_ACK;
 				xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
-				nodeTable[nodeID].nodeStatusWord &= 0xFFFFFFF8;
-				nodeTable[nodeID].nodeStatusWord |= CONNECTING;
+				nodeTable[nodeID].nodeConnectionState = CONNECTING;
 				xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
 			}
 			else {
 				// Incorrect firmware version
 				shutdownCMD.core.Data[0] = CC_NACK;
 				xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
-				nodeTable[nodeID].nodeStatusWord &= 0xFFFFFFF8;
-				nodeTable[nodeID].nodeStatusWord |= DISCONNECTED;
+				nodeTable[nodeID].nodeConnectionState = DISCONNECTED;
 				xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
 			}
 
@@ -1024,7 +1023,8 @@ void doProcessCan(void const * argument)
 				// Respond to the motorCAN
 				xQueueSend(motCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
 			}
-			xQueueSend(mainCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
+
+			//XXX xQueueSend(mainCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
 		}
 		/*
 		else {
@@ -1073,19 +1073,19 @@ void doMotCanTx(void const * argument)
 	  xQueueReceive(motCanTxBufHandle, &newFrame, portMAX_DELAY);	// Only process CAN Transmissions when the queue is non-empty
 	  uint32_t motStatus = nodeTable[mc_nodeID].nodeStatusWord & 0x07;
 
-	  // TODO: May have to check the tx states for motor controller
 	  if ((motStatus & 0x07) != CONN_ERROR){
 		  // Only send to motor controller if it is ACTIVE or in SHUTDOWN mode
 		  while(Can_availableForTx() == 0){	// Wait if bxCAN module is still busy
 			  osDelay(motCanTxInterval);
 		  }
-
 		  // Motor CAN diagnostic request is an extended frame
 		  if (newFrame.isExt){
-			  Can_sendExt(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
+			Can_sendExt(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
 		  } else{
-			  Can_sendStd(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
+			Can_sendStd(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
 		  }
+
+		  for(uint8_t i = 0; i < 750; i++);	// Small busy loop delay to throttle the CAN rate
 	  }
   }
   /* USER CODE END doMotCanTx */
@@ -1123,13 +1123,8 @@ void TmrSendHB(void const * argument)
 		newFrame.core.id = mitsubaREQ;
 		newFrame.core.dlc = Req_DLC;
 		newFrame.core.Data[0] = Req_Frm0 | Req_Frm1 | Req_Frm2;
-		// TODO: Check if the data above is in the correct form!
-	#ifdef DEBUG
-		static uint8_t hbmsg[] = "Motor diagnositc request issued\n";
-		Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
-	#endif
 
-		xQueueSendToFront(motCanTxBufHandle, &newFrame, 0);
+		xQueueSend(motCanTxBufHandle, &newFrame, portMAX_DELAY);
 	}
 
 	// CC-MC Heartbeat
@@ -1143,13 +1138,10 @@ void TmrSendHB(void const * argument)
 			newFrame.core.Data[3-i] = (nodeTable[cc_nodeID].nodeStatusWord >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
 		}
 
-	#ifdef DEBUG
-		static uint8_t hbmsg[] = "CC->MC HB issued\n";
-		Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
-	#endif
-
-		xQueueSendToFront(motCanTxBufHandle, &newFrame, 0);
+		xQueueSend(motCanTxBufHandle, &newFrame, portMAX_DELAY);
 	}
+	uint8_t items = uxQueueSpacesAvailable(motCanTxBufHandle);
+	Serial2_write(items);
   /* USER CODE END TmrSendHB */
 }
 
