@@ -320,7 +320,24 @@ void motCanRxCallback(){
 	// Parse the CAN frame
 	// Map motor CAN EXT frame to main CAN Std frame
 	newCore.id = (hcan1.pRxMsg->IDE) ? hcan1.pRxMsg->ExtId : hcan1.pRxMsg->StdId;
+	newCore.dlc = hcan1.pRxMsg->DLC;
+	if(hcan1.pRxMsg->RTR == 0){
+		for(int i=0; i<newCore.dlc; i++){
+			newCore.Data[i] = hcan1.pRxMsg->Data[i];
+		}
+	}
+
 	switch(newCore.id){
+	case mc_FW:
+		// Pipe this to the mainCanRxBuf Handle
+		xQueueSendToFrontFromISR(mainCanRxBufHandle, &newCore, pdFALSE);
+		break;
+
+	case mc_SW:
+		// Pipe this to the mainCanRxBuf Handle
+		xQueueSendToFrontFromISR(mainCanRxBufHandle, &newCore, pdFALSE);
+		break;
+
 	case mitsubaFr0:
 		newCore.id = mcDiag0;
 		break;
@@ -334,15 +351,8 @@ void motCanRxCallback(){
 		break;
 	}
 
-	newCore.dlc = hcan1.pRxMsg->DLC;
-	if(hcan1.pRxMsg->RTR == 0){
-		for(int i=0; i<newCore.dlc; i++){
-			newCore.Data[i] = hcan1.pRxMsg->Data[i];
-		}
-	}
-
 	// XXX: Any data to additional application layer tasks should be buffered with Queues
-	xQueueSend(mainCanTxBufHandle, &newCore, portMAX_DELAY);	// Push the data onto main CAN for radio
+	xQueueSendFromISR(mainCanTxBufHandle, &newCore, pdFALSE);	// Push the data onto main CAN for radio
 }
 
 /*
@@ -433,7 +443,7 @@ int main(void)
   Can_begin();
   Can_setRxCallback(motCanRxCallback);
   setupNodeTable();
-  nodeTable[cc_nodeID].nodeStatusWord |= ACTIVE;		// Set initial status to ACTIVE
+  nodeTable[cc_nodeID].nodeStatusWord = ACTIVE;		// Set initial status to ACTIVE
 
   // Set up CAN filter banks
   Can_addMaskedFilterStd(swOffset,0xFF0,0); // Filter: Status word group (ignore nodeID)
@@ -826,61 +836,62 @@ void doRealTime(void const * argument)
 
   for(;;)
   {
-	// ALL CRITICAL MOTOR CONTROLS SHOULD BE TOGGLE SWITCHES; NO PUSH BUTTONS!
-	xSemaphoreTake(ctrlVarMtxHandle,portMAX_DELAY);
-	// TODO: Read ADC values, and update userInputs struct
-	xSemaphoreGive(ctrlVarMtxHandle);
+	  if(((nodeTable[mc_nodeID].nodeStatusWord & 0x07) == ACTIVE) || ((nodeTable[mc_nodeID].nodeStatusWord & 0x07) == SHUTDOWN)){
+		// ALL CRITICAL MOTOR CONTROLS SHOULD BE TOGGLE SWITCHES; NO PUSH BUTTONS!
+		xSemaphoreTake(ctrlVarMtxHandle,portMAX_DELAY);
+		// TODO: Read ADC values, and update userInputs struct
+		xSemaphoreGive(ctrlVarMtxHandle);
 
-	uint32_t currentTickTime = osKernelSysTick();
-	// Assemble Switch Position frame
-	static Can_frame_t newFrame;
-	newFrame.isExt = 0;
-	newFrame.isRemote = 0;
-	newFrame.core.id = swPos;
-	newFrame.core.dlc = swPos_DLC;
-	// TODO: assemble switch position data
+		uint32_t currentTickTime = osKernelSysTick();
+		// Assemble Switch Position frame
+		static Can_frame_t newFrame;
+		newFrame.isExt = 0;
+		newFrame.isRemote = 0;
+		newFrame.core.id = swPos;
+		newFrame.core.dlc = swPos_DLC;
+		// TODO: assemble switch position data
 
-	if(currentTickTime - delayTickMarker >= ctrlVarTxInterval){
+		if(currentTickTime - delayTickMarker >= ctrlVarTxInterval){
+			// TODO: Send to mainCAN
+		}
+
+		xQueueSend(motCanTxBufHandle, &newFrame, 0);
+
+		// Assemble Brake Position frame
+		newFrame.core.id = brakePos;
+		newFrame.core.dlc = brakePos_DLC;
+		for(int i=0; i<4; i++){
+			newFrame.core.Data[3-i] = ((uint32_t)(userInput.brakePosition) >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
+		}
+
 		// TODO: Send to mainCAN
-	}
+		xQueueSend(motCanTxBufHandle, &newFrame, 0);
 
-	xQueueSend(motCanTxBufHandle, &newFrame, 0);
+		// Assemble Accelerator Position frame
+		newFrame.core.id = accelPos;
+		newFrame.core.dlc = accelPos_DLC;
+		for(int i=0; i<4; i++){
+			newFrame.core.Data[3-i] = ((uint32_t)(userInput.accelPosition) >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
+		}
 
-	// Assemble Brake Position frame
-	newFrame.core.id = brakePos;
-	newFrame.core.dlc = brakePos_DLC;
-	for(int i=0; i<4; i++){
-		newFrame.core.Data[3-i] = ((uint32_t)(userInput.brakePosition) >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
-	}
+		if(currentTickTime - delayTickMarker >= ctrlVarTxInterval){
+			// TODO: Send to mainCAN
+		}
+		xQueueSend(motCanTxBufHandle, &newFrame, 0);
 
-	// TODO: Send to mainCAN
-	xQueueSend(motCanTxBufHandle, &newFrame, 0);
+		// Assemble Regen Position frame
+		newFrame.core.id = regenPos;
+		newFrame.core.dlc = regenPos_DLC;
+		for(int i=0; i<4; i++){
+			newFrame.core.Data[3-i] = ((uint32_t)(userInput.regenPosition) >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
+		}
 
-	// Assemble Accelerator Position frame
-	newFrame.core.id = accelPos;
-	newFrame.core.dlc = accelPos_DLC;
-	for(int i=0; i<4; i++){
-		newFrame.core.Data[3-i] = ((uint32_t)(userInput.accelPosition) >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
-	}
-
-	if(currentTickTime - delayTickMarker >= ctrlVarTxInterval){
-		// TODO: Send to mainCAN
-	}
-	xQueueSend(motCanTxBufHandle, &newFrame, 0);
-
-	// Assemble Regen Position frame
-	newFrame.core.id = regenPos;
-	newFrame.core.dlc = regenPos_DLC;
-	for(int i=0; i<4; i++){
-		newFrame.core.Data[3-i] = ((uint32_t)(userInput.regenPosition) >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
-	}
-
-	if(currentTickTime - delayTickMarker >= ctrlVarTxInterval){
-		// TODO: Send to mainCAN
-		delayTickMarker = osKernelSysTick();		// Only reset at the very end to ensure that all 3 variables are sent synchronously
-	}
-	xQueueSend(motCanTxBufHandle, &newFrame, 0);
-
+		if(currentTickTime - delayTickMarker >= ctrlVarTxInterval){
+			// TODO: Send to mainCAN
+			delayTickMarker = osKernelSysTick();		// Only reset at the very end to ensure that all 3 variables are sent synchronously
+		}
+		xQueueSend(motCanTxBufHandle, &newFrame, 0);
+	  }
 	// Periodic function
 	osDelayUntil(&PreviousTickTime, RT_Interval);
   }
@@ -919,7 +930,7 @@ void doProcessCan(void const * argument)
   {
 	static Can_frame_t newFrame;
 	xQueueReceive(mainCanRxBufHandle, &newFrame, portMAX_DELAY);
-	uint8_t canID = newFrame.core.id;	// canID container
+	uint32_t canID = newFrame.core.id;	// canID container
 	uint8_t nodeID = canID & 0x00F;		// nodeID container
 
 	// CAN ID group processing
@@ -1008,6 +1019,11 @@ void doProcessCan(void const * argument)
 				nodeTable[nodeID].nodeStatusWord |= DISCONNECTED;
 				xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
 			}
+
+			if(nodeID == mc_nodeID){
+				// Respond to the motorCAN
+				xQueueSend(motCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
+			}
 			xQueueSend(mainCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
 		}
 		/*
@@ -1058,7 +1074,7 @@ void doMotCanTx(void const * argument)
 	  uint32_t motStatus = nodeTable[mc_nodeID].nodeStatusWord & 0x07;
 
 	  // TODO: May have to check the tx states for motor controller
-	  if (((motStatus & 0x07) == ACTIVE) || ((motStatus & 0x07) == SHUTDOWN)){
+	  if ((motStatus & 0x07) != CONN_ERROR){
 		  // Only send to motor controller if it is ACTIVE or in SHUTDOWN mode
 		  while(Can_availableForTx() == 0){	// Wait if bxCAN module is still busy
 			  osDelay(motCanTxInterval);

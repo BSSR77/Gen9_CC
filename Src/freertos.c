@@ -44,17 +44,16 @@
 /* Includes ------------------------------------------------------------------*/
 #include "FreeRTOS.h"
 #include "task.h"
+
+/* USER CODE BEGIN Includes */
 #include "main.h"
 #include "../../CAN_ID.h"
-
-/* USER CODE BEGIN Includes */     
-
 /* USER CODE END Includes */
 
 /* Variables -----------------------------------------------------------------*/
 
 /* USER CODE BEGIN Variables */
-
+extern nodeEntry * nodeTable;
 /* USER CODE END Variables */
 
 /* Function prototypes -------------------------------------------------------*/
@@ -66,8 +65,6 @@
 /* Hook prototypes */
 void vApplicationStackOverflowHook(TaskHandle_t xTask, signed char *pcTaskName);
 void vApplicationMallocFailedHook(void);
-
-extern nodeEntry * nodeTable;
 
 /* USER CODE BEGIN 4 */
 __weak void vApplicationStackOverflowHook(TaskHandle_t xTask, signed char *pcTaskName)
