@@ -119,6 +119,27 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
 	}
 }
 
+void executeCommand(nodeCommands cmd){
+	switch(cmd){
+	case(NODE_HRESET):
+			//TODO hard reset
+			break;
+	case(NODE_RESET):
+			// TODO soft reset
+			break;
+
+	case(NODE_SHUTDOWN):
+			// TODO shutdown
+			break;
+
+	case(NODE_START):
+			// TODO start
+			break;
+	default:
+		break;
+	}
+}
+
 // Handler for node HB timeout
 void TmrHBTimeout(void const * argument){
  	uint8_t timerID = (uint8_t)pvTimerGetTimerID((TimerHandle_t)argument);
@@ -135,34 +156,34 @@ void TmrHBTimeout(void const * argument){
 }
 
 void setupNodeTable(){
+	for(uint8_t i = 0; i < MAX_NODE_NUM; i++){
+		nodeTable[i].nodeStatusWord = SW_Sentinel;			// Initialize status word to SENTINEL
+		nodeTable[i].nodeFirmwareVersion = SW_Sentinel;		// Initialize firm ware version to SENTINEL
+	}
+
 	#ifdef cc_nodeID
 		nodeTable[cc_nodeID].nodeConnectionState = DISCONNECTED;
 		nodeTable[cc_nodeID].nodeFirmwareVersion = cc_VERSION;
-		nodeTable[cc_nodeID].nodeStatusWord = SW_Sentinel;
 	#endif
 
 	#ifdef mc_nodeID
 		nodeTable[mc_nodeID].nodeConnectionState = DISCONNECTED;
 		nodeTable[mc_nodeID].nodeFirmwareVersion = mc_VERSION;
-		nodeTable[mc_nodeID].nodeStatusWord = SW_Sentinel;
 	#endif
 
 	#ifdef bps_nodeID
 		nodeTable[bps_nodeID].nodeConnectionState = DISCONNECTED;
 		nodeTable[bps_nodeID].nodeFirmwareVersion = bps_VERSION;
-		nodeTable[bps_nodeID].nodeStatusWord = SW_Sentinel;
 	#endif
 
 	#ifdef ads_nodeID
 		nodeTable[ads_nodeID].nodeConnectionState = DISCONNECTED;
 		nodeTable[ads_nodeID].nodeFirmwareVersion = ads_VERSION;
-		nodeTable[ads_nodeID].nodeStatusWord = SW_Sentinel;
 	#endif
 
 	#ifdef radio_nodeID
 		nodeTable[radio_nodeID].nodeConnectionState = DISCONNECTED;
 		nodeTable[radio_nodeID].nodeFirmwareVersion = radio_VERSION;
-		nodeTable[radio_nodeID].nodeStatusWord = SW_Sentinel;
 	#endif
 }
 
@@ -312,8 +333,6 @@ int main(void)
   HBTmrHandle = osTimerCreate(osTimer(HBTmr), osTimerPeriodic, NULL);
 
   /* USER CODE BEGIN RTOS_TIMERS */
-  //Start the watchdog and heartbeat timers
-  osTimerStart(HBTmrHandle, CCMC_HB_Interval);
   // Node heartbeat timeout timers
   for(uint8_t TmrID = 0; TmrID < MAX_NODE_NUM; TmrID++){
 	  osTimerDef(TmrID, TmrHBTimeout);
@@ -743,7 +762,108 @@ void doProcessCan(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+	static Can_frame_t newFrame;
+	xQueueReceive(mainCanRxBufHandle, &newFrame, portMAX_DELAY);
+	uint8_t canID = newFrame.core.id;	// canID container
+	uint8_t nodeID = canID & 0x00F;		// nodeID container
+	uint32_t temp_data;					// Temporary data container
+	for(int i=0; i<4; i++){
+		temp_data |= (newFrame.core.Data[i] << (8*(3-i)));
+	}
+	// CAN ID group processing
+	if(canID == p2pOffset){
+		// CAN ID is a P2P ID -> command
+		executeCommand((nodeCommands)newFrame.core.Data);	// Byte length command, no need to put into uint32_t form
+	}
+	else if ((canID & 0xFF0) == swOffset){
+		// Check if node is defined in nodeTable
+		if(nodeTable[nodeID].nodeFirmwareVersion == SW_Sentinel)
+		{
+			// Node not in registered domain; Send SHUTDOWN command to node
+			static Can_frame_t shutdownCMD;
+			shutdownCMD.isExt = 0;
+			shutdownCMD.isRemote = 0;
+			shutdownCMD.core.id = nodeID + p2pOffset;
+			shutdownCMD.core.dlc = CMD_DLC;
+			shutdownCMD.core.Data[0] = SHUTDOWN;
+			xQueueSend(mainCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
+			break;
+		}
+		// CAN ID is a status word address
+		if(nodeTable[nodeID].nodeConnectionState == CONNECTED){
+			xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
+			nodeTable[nodeID].nodeStatusWord = temp_data;
+			xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
+			if((temp_data & 0x07) == ACTIVE){
+				xTimerReset(nodeTmrHandle[nodeID], portMAX_DELAY);	// Reset the node heartbeat count down
+			}
+			else if (((temp_data & 0x07) == SHUTDOWN)){
+				xTimerStop(nodeTmrHandle[nodeID], portMAX_DELAY);	// Stop the heartbeat timer when the node is in SHUTDOWN state
+			}
+		}
+		else if(nodeTable[nodeID].nodeConnectionState == CONNECTING){
+			if((temp_data & 0x07) == ACTIVE){
+				xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
+				nodeTable[nodeID].nodeStatusWord = temp_data;
+				nodeTable[nodeID].nodeConnectionState = CONNECTED;
+				xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
+
+				if(nodeID == mc_nodeID){
+					xTimerReset(HBTmrHandle, portMAX_DELAY);		// Start the timer for the motor heartbeat
+				}
+			}
+			// If node not in ACTIVE state, will continue waiting until HB timeout and the node is flagged as unreliable
+			xTimerReset(nodeTmrHandle[nodeID], portMAX_DELAY);	// Start the timer for the new node
+		}
+		else{
+			xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
+			nodeTable[nodeID].nodeStatusWord &= 0xFFFFFFF0;
+			nodeTable[nodeID].nodeStatusWord |= UNRELIABLE;
+			xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
+			xQueueSend(badNodesHandle, &nodeID, portMAX_DELAY);
+		}
+	}
+	else if((canID & 0xFF0) == fwOffset){
+
+		static Can_frame_t shutdownCMD;
+		shutdownCMD.isExt = 0;
+		shutdownCMD.isRemote = 0;
+		shutdownCMD.core.id = nodeID + p2pOffset;
+		shutdownCMD.core.dlc = CMD_DLC;
+
+		// Check if node is in table
+		if(nodeTable[nodeID].nodeFirmwareVersion == SW_Sentinel)
+		{
+			// Node not in registered domain; Send SHUTDOWN command to node
+			shutdownCMD.core.Data[0] = SHUTDOWN;
+		}
+		else if(temp_data == nodeTable[nodeID].nodeFirmwareVersion){
+			// Firmware version accepted
+			shutdownCMD.core.Data[0] = CC_ACK;
+			xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
+			nodeTable[nodeID].nodeStatusWord &= 0xFFFFFFF0;
+			nodeTable[nodeID].nodeStatusWord |= CONNECTING;
+			xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
+		}
+		else {
+			// Incorrect firmware version
+			shutdownCMD.core.Data[0] = CC_NACK;
+			xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
+			nodeTable[nodeID].nodeStatusWord &= 0xFFFFFFF0;
+			nodeTable[nodeID].nodeStatusWord |= DISCONNECTED;
+			xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
+		}
+		xQueueSend(mainCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
+	}
+	else {
+		// Individual CAN ID Processing
+		switch(canID){
+			// Insert CAN IDs here
+			default:
+				// Ignore other incoming frames
+				break;
+		}
+	}
   }
   /* USER CODE END doProcessCan */
 }
