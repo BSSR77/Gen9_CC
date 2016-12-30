@@ -123,9 +123,10 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
 void TmrHBTimeout(void const * argument){
  	uint8_t timerID = (uint8_t)pvTimerGetTimerID((TimerHandle_t)argument);
 #ifdef DEBUG
-	Serial2_writeBytes("Timer ",6);
-	Serial2_write(timerID);
-	Serial2_writeBytes(" triggered!\n",12);
+ 	Serial2_write(timerID);
+ 	static uint8_t msg[] = "Timer Triggered\n";
+	Serial2_writeBytes(msg,sizeof(msg)-1);
+
 #endif
 	nodeTable[timerID].nodeConnectionState = UNRELIABLE;
 	if((timerID) != mc_nodeID){
@@ -198,6 +199,32 @@ void motCanRxCallback(){
 
 	// TODO: Any data to additional application layer tasks should be buffered with Queues
 	xQueueSend(mainCanTxBufHandle, &newCore, portMAX_DELAY);	// Push the data onto main CAN for radio
+}
+
+/*
+ * Rest node given nodeID, the attempt number, and the last tick count for delay Until
+ * Will ultimately destroy the task running it
+ */
+void resetNode(resetParams * passed){
+	if(passed->attempts == 0){
+		// Send RESET command to node
+		osDelayUntil(&(passed->ticks), HB_Interval);
+		if((nodeTable[passed->nodeID].nodeConnectionState & 0x07) == UNRELIABLE){
+			passed->attempts = passed->attempts+1;
+			resetNode(passed);	// Retry
+		}
+		else{
+			// Recovery successful
+			vTaskDelete(NULL);
+		}
+	}
+	else if(passed->attempts > MAX_RESET_ATTEMPTS){
+		// Recovery failed, set node to Hard Error!
+		xSemaphoreTake(nodeEntryMtxHandle[passed->nodeID], portMAX_DELAY);
+		nodeTable[passed->nodeID].nodeConnectionState = HARD_ERROR;
+		xSemaphoreTake(nodeEntryMtxHandle[passed->nodeID], portMAX_DELAY);
+		vTaskDelete(NULL);
+	}
 }
 
 /* USER CODE END PFP */
@@ -622,7 +649,7 @@ void doRealTime(void const * argument)
    * Push variables to mainCanTxBuf
    * Push variables to motCanTxBuf
    * */
-  TickType_t xLastWakeTime = xTaskGetTickCount ();
+  uint32_t PreviousTickTime = osKernelSysTick();
 
   for(;;)
   {
@@ -642,7 +669,7 @@ void doRealTime(void const * argument)
 	}
 
 	// TODO: Send to mainCAN
-	xQueueSendToFront(motCanTxBufHandle, &newFrame, 0);
+	xQueueSend(motCanTxBufHandle, &newFrame, 0);
 
 	// Assemble Accelerator Position frame
 	newFrame.isExt = 0;
@@ -654,7 +681,7 @@ void doRealTime(void const * argument)
 	}
 
 	// TODO: Send to mainCAN
-	xQueueSendToFront(motCanTxBufHandle, &newFrame, 0);
+	xQueueSend(motCanTxBufHandle, &newFrame, 0);
 
 	// Assemble Regen Position frame
 	newFrame.isExt = 0;
@@ -666,13 +693,9 @@ void doRealTime(void const * argument)
 	}
 
 	// TODO: Send to mainCAN
-	xQueueSendToFront(motCanTxBufHandle, &newFrame, 0);
+	xQueueSend(motCanTxBufHandle, &newFrame, 0);
 
-#ifdef DEBUG
-	static uint8_t hbmsg[] = "Driver inputs sent!\n";
-	Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
-#endif
-	osDelayUntil(xLastWakeTime, RT_Interval);
+	osDelayUntil(&PreviousTickTime, RT_Interval);
   }
   /* USER CODE END 5 */ 
 }
@@ -719,7 +742,14 @@ void doNodeManager(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+	uint8_t badNodeID;
+	xQueueReceive(badNodesHandle, &badNodeID, portMAX_DELAY);
+	resetParams toPass;
+	toPass.nodeID = badNodeID;
+	toPass.attempts = 0;
+	toPass.ticks = osKernelSysTick();
+	//TODO: Test whether ther struct has been successfully passed in or not
+	xTaskCreate(resetNode, (const char*)"", 512, (void *)(&toPass), uxTaskPriorityGet(NULL),NULL);
   }
   /* USER CODE END doNodeManager */
 }
@@ -760,14 +790,14 @@ void doKickDog(void const * argument)
 {
   /* USER CODE BEGIN doKickDog */
   /* Infinite loop */
-  TickType_t xLastWakeTime = xTaskGetTickCount ();
+  uint32_t PreviousTickTime = osKernelSysTick();
   for(;;)
   {
 	taskENTER_CRITICAL();
 	HAL_WWDG_Refresh(&hwwdg);
 	taskEXIT_CRITICAL();
 
-	vTaskDelayUntil(&xLastWakeTime, WD_Interval);
+	osDelayUntil(&PreviousTickTime, WD_Interval);
   }
   /* USER CODE END doKickDog */
 }

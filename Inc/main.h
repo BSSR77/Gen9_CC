@@ -72,7 +72,8 @@
 #define Driver_D0_Pin GPIO_PIN_6
 #define Driver_D0_GPIO_Port GPIOB
 /* USER CODE BEGIN Private defines */
-#define MAX_NODE_NUM 16		// Maximum number of nodes supported on this system
+#define MAX_NODE_NUM 		16		// Maximum number of nodes supported on this system
+#define MAX_RESET_ATTEMPTS	1		// Maximum number of retries CC will attempt before flagging node as HARD ERROR
 
 #define WD_Interval			16		// Watchdog reset interval (ticks)
 #define CCMC_HB_Interval	2000	// CC -> MC Heartbeat interval (ticks)
@@ -94,6 +95,12 @@ typedef struct {
 	float	 accelPosition;
 	float	 regenPosition;
 } controlVars;
+
+typedef struct{
+	uint8_t  nodeID;
+	uint8_t	 attempts;
+	uint32_t ticks;
+} resetParams;
 /* USER CODE END Private defines */
 
 /**
