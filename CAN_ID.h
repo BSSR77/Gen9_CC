@@ -10,6 +10,7 @@
 
 #define CAN_HB_DLC 	 	 4							// Heartbeat frame data length
 #define CAN_FW_DLC		 4							// Firmware version data length
+#define CMD_DLC			 1							// Command data length
 #define SW_Sentinel		 0xFFFFFFFF					// Sentinel indicating bad status word
 #define HB_Interval		 1000						// CAN Heart-beat interval (ticks)
 #define FW_Interval		 50							// Firmware broadcast interval (ticks)
@@ -76,14 +77,14 @@ enum nodeState{
 	HARD_ERROR
 };
 
-enum nodeCommands{
+typedef enum {
 	NODE_HRESET,
 	NODE_RESET,
 	NODE_SHUTDOWN,
 	NODE_START,
 	CC_ACK,
 	CC_NACK
-};
+} nodeCommands;
 
 // Error Messages
 #define SysEMSD			0x10		// System emergency shutdown (Hard)
