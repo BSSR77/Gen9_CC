@@ -88,6 +88,7 @@ osSemaphoreId spiRxDirtyHandle;
 osMutexId nodeEntryMtxHandle[MAX_NODE_NUM];		// Mutex for every node table entry
 osTimerId nodeTmrHandle[MAX_NODE_NUM];			// Timer for each node's timeout timer
 nodeEntry nodeTable[MAX_NODE_NUM];
+controlVars userInput;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -164,6 +165,41 @@ void setupNodeTable(){
 	#endif
 }
 
+/*
+ * Motor CAN Receive callback
+ * Currently implemented to dump all incoming frame cores into the mainCAN
+ */
+void motCanRxCallback(){
+	static Can_frame_core_t newCore;
+
+	// Parse the CAN frame
+	// Map motor CAN EXT frame to main CAN Std frame
+	newCore.id = (hcan1.pRxMsg->IDE) ? hcan1.pRxMsg->ExtId : hcan1.pRxMsg->StdId;
+	switch(newCore.id){
+	case mitsubaFr0:
+		newCore.id = mcDiag0;
+		break;
+
+	case mitsubaFr1:
+		newCore.id = mcDiag1;
+		break;
+
+	case mitsubaFr2:
+		newCore.id = mcDiag2;
+		break;
+	}
+
+	newCore.dlc = hcan1.pRxMsg->DLC;
+	if(hcan1.pRxMsg->RTR == 0){
+		for(int i=0; i<newCore.dlc; i++){
+			newCore.Data[i] = hcan1.pRxMsg->Data[i];
+		}
+	}
+
+	// TODO: Any data to additional application layer tasks should be buffered with Queues
+	xQueueSend(mainCanTxBufHandle, &newCore, portMAX_DELAY);	// Push the data onto main CAN for radio
+}
+
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
@@ -199,7 +235,12 @@ int main(void)
 	static uint8_t hbmsg[] = "Command Center booting... \n";
 	Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
 #endif
+  Can_begin();
+  Can_setRxCallback(motCanRxCallback);
   setupNodeTable();
+  nodeTable[cc_nodeID].nodeStatusWord |= ACTIVE;
+
+  // TODO: configure bxCAN to receive extended IDs from Mitsuba controller
   /* USER CODE END 2 */
 
   /* Create the mutex(es) */
@@ -574,12 +615,64 @@ static void MX_GPIO_Init(void)
 /* doRealTime function */
 void doRealTime(void const * argument)
 {
-
   /* USER CODE BEGIN 5 */
-  /* Infinite loop */
+  /* Infinite loop
+   * Take GPIO and ADC readings
+   * Put into userInputs struct
+   * Push variables to mainCanTxBuf
+   * Push variables to motCanTxBuf
+   * */
+  TickType_t xLastWakeTime = xTaskGetTickCount ();
+
   for(;;)
   {
-	osDelay(1);
+	// Switch positions are sent in their individual GPIO interrupts!
+	xSemaphoreTake(ctrlVarMtxHandle,portMAX_DELAY);
+	// TODO: Read ADC values, and update userInputs struct
+	xSemaphoreGive(ctrlVarMtxHandle);
+
+	// Assemble Brake Position frame
+	static Can_frame_t newFrame;
+	newFrame.isExt = 0;
+	newFrame.isRemote = 0;
+	newFrame.core.id = brakePos;
+	newFrame.core.dlc = brakePos_DLC;
+	for(int i=0; i<4; i++){
+		newFrame.core.Data[3-i] = ((uint32_t)(userInput.brakePosition) >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
+	}
+
+	// TODO: Send to mainCAN
+	xQueueSendToFront(motCanTxBufHandle, &newFrame, 0);
+
+	// Assemble Accelerator Position frame
+	newFrame.isExt = 0;
+	newFrame.isRemote = 0;
+	newFrame.core.id = accelPos;
+	newFrame.core.dlc = accelPos_DLC;
+	for(int i=0; i<4; i++){
+		newFrame.core.Data[3-i] = ((uint32_t)(userInput.accelPosition) >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
+	}
+
+	// TODO: Send to mainCAN
+	xQueueSendToFront(motCanTxBufHandle, &newFrame, 0);
+
+	// Assemble Regen Position frame
+	newFrame.isExt = 0;
+	newFrame.isRemote = 0;
+	newFrame.core.id = regenPos;
+	newFrame.core.dlc = regenPos_DLC;
+	for(int i=0; i<4; i++){
+		newFrame.core.Data[3-i] = ((uint32_t)(userInput.regenPosition) >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
+	}
+
+	// TODO: Send to mainCAN
+	xQueueSendToFront(motCanTxBufHandle, &newFrame, 0);
+
+#ifdef DEBUG
+	static uint8_t hbmsg[] = "Driver inputs sent!\n";
+	Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
+#endif
+	osDelayUntil(xLastWakeTime, RT_Interval);
   }
   /* USER CODE END 5 */ 
 }
@@ -651,7 +744,12 @@ void doMotCanTx(void const * argument)
 			  osDelay(motCanTxInterval);
 		  }
 
-		  Can_sendStd(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
+		  // Motor CAN diagnostic request is an extended frame
+		  if (newFrame.isExt){
+			  Can_sendExt(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
+		  } else{
+			  Can_sendStd(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
+		  }
 	  }
   }
   /* USER CODE END doMotCanTx */
@@ -681,22 +779,38 @@ void TmrSendHB(void const * argument)
 	static Can_frame_t newFrame;
 	uint32_t motStatus = nodeTable[mc_nodeID].nodeStatusWord & 0x07;
 
+	// MC Diagnostic request
+	if(motStatus == ACTIVE){
+		// Only send HB to MC if MC is in ACTIVE or SHUTDOWN state
+		newFrame.isExt = 1;
+		newFrame.isRemote = 0;
+		newFrame.core.id = mitsubaREQ;
+		newFrame.core.dlc = Req_DLC;
+		newFrame.core.Data[0] = Req_Frm0 | Req_Frm1 | Req_Frm2;
+		// TODO: Check if the data above is in the correct form!
+	#ifdef DEBUG
+		static uint8_t hbmsg[] = "Motor diagnositc request issued\n";
+		Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
+	#endif
+
+		xQueueSendToFront(motCanTxBufHandle, &newFrame, 0);
+	}
+
+	// CC-MC Heartbeat
 	if((motStatus == ACTIVE) || (motStatus == SHUTDOWN)){
 		// Only send HB to MC if MC is in ACTIVE or SHUTDOWN state
 		newFrame.isExt = 0;
 		newFrame.isRemote = 0;
-		xSemaphoreTake(nodeEntryMtxHandle[cc_nodeID], portMAX_DELAY);
 		newFrame.core.id = cc_SW;
-		xSemaphoreGive(nodeEntryMtxHandle[cc_nodeID]);
 		newFrame.core.dlc = CAN_HB_DLC;
 		for(int i=0; i<4; i++){
 			newFrame.core.Data[3-i] = (nodeTable[cc_nodeID].nodeStatusWord >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
 		}
 
-#ifdef DEBUG
-	static uint8_t hbmsg[] = "CC->MC HB issued\n";
-	Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
-#endif
+	#ifdef DEBUG
+		static uint8_t hbmsg[] = "CC->MC HB issued\n";
+		Serial2_writeBytes(hbmsg, sizeof(hbmsg)-1);
+	#endif
 
 		xQueueSendToFront(motCanTxBufHandle, &newFrame, 0);
 	}

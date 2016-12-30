@@ -76,6 +76,7 @@
 
 #define WD_Interval			16		// Watchdog reset interval (ticks)
 #define CCMC_HB_Interval	2000	// CC -> MC Heartbeat interval (ticks)
+#define RT_Interval			10		// Refresh interval for driver controls
 
 #define motCanTxInterval	1		// Motor CAN transmission interval (ticks)
 #define mainCanTxInterval	1		// Main CAN transmission interval (ticks)
@@ -86,6 +87,13 @@ typedef struct {
 	uint32_t nodeFirmwareVersion;
 	uint32_t nodeStatusWord;
 } nodeEntry;
+
+typedef struct {
+	uint16_t switchPositions;
+	float	 brakePosition;
+	float	 accelPosition;
+	float	 regenPosition;
+} controlVars;
 /* USER CODE END Private defines */
 
 /**
