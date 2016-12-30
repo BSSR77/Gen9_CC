@@ -119,25 +119,108 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
 	}
 }
 
+static inline void shutdown_routine(){
+	// Don't care about locking the statusWord here since we are in Critical Area
+	nodeTable[cc_nodeID].nodeStatusWord &= 0xfffffff8;	// Clear the node status field
+	nodeTable[cc_nodeID].nodeStatusWord |= SHUTDOWN;		// Set status to shutdown
+
+	// Send status word indicating node shutdown to CC
+	static Can_frame_t newFrame;
+	// Switch positions to indicate motor neutral
+	newFrame.isExt = 0;
+	newFrame.isRemote = 0;
+	newFrame.core.id = swPos;
+	newFrame.core.dlc = swPos_DLC;
+	// TODO: fill in switch data
+	while(Can_availableForTx() == 0){	// Wait if bxCAN module is still busy
+	  osDelay(motCanTxInterval);
+	}
+	Can_sendStd(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
+
+	// Send frame to motor CAN to set throttle to 0.0
+	newFrame.core.id = accelPos;
+	newFrame.core.dlc = accelPos_DLC;
+	for(uint i = 0 ; i < 4; i++){
+		newFrame.core.Data[i] = 0;	// float -> 0.0
+	}
+	while(Can_availableForTx() == 0){	// Wait if bxCAN module is still busy
+	  osDelay(motCanTxInterval);
+	}
+	Can_sendStd(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
+
+	// Send frame to motor CAN to set regen to 0.0
+	newFrame.core.id = regenPos;
+	newFrame.core.dlc = regenPos_DLC;
+	// Data is same as above -> float 0.0
+	while(Can_availableForTx() == 0){	// Wait if bxCAN module is still busy
+	  osDelay(motCanTxInterval);
+	}
+	Can_sendStd(newFrame.core.id,newFrame.isRemote,newFrame.core.Data,newFrame.core.dlc);
+
+	// Broadcast CC shutdown to main CAN
+	newFrame.core.id = radio_SW;
+	newFrame.core.dlc = CAN_HB_DLC;
+	for(int i=0; i<4; i++){
+		newFrame.core.Data[3-i] = (nodeTable[cc_nodeID].nodeStatusWord >> (8*i)) & 0xff;			// Convert uint32_t -> uint8_t
+	}
+	xQueueSendFromISR(mainCanTxBufHandle, &newFrame, pdFALSE);
+	HAL_Delay(1);	// 1ms delay to ensure the queue is properly updated before proceeding
+
+	// Loop through Main CAN Tx buffer to send any pending messages
+	while(uxQueueMessagesWaitingFromISR(mainCanTxBufHandle) != 0){
+		while(Can_availableForTx() == 0){	// Wait if bxCAN module is still busy
+			HAL_WWDG_Refresh(&hwwdg);		// Since we are in the
+			HAL_Delay(1);					// Hard delay to flush CAN tx buffers
+		}
+		xQueueReceiveFromISR(mainCanTxBufHandle, &newFrame, pdFALSE);
+		// TODO: Send main CAN message buffers
+	}
+}
+
 void executeCommand(nodeCommands cmd){
+	taskENTER_CRITICAL();
+	static Can_frame_t resetCmd;
+	static uint8_t msg[] = "Node hard reset issued\n";
 	switch(cmd){
 	case(NODE_HRESET):
-			//TODO hard reset
-			break;
+	#ifdef DEBUG
+		Serial2_writeBytes(msg, sizeof(msg)-1);
+	#endif
+		NVIC_SystemReset();					// CMSIS System reset function
+		break;
 	case(NODE_RESET):
-			// TODO soft reset
-			break;
+		shutdown_routine();
+		NVIC_SystemReset();
+		break;
 
 	case(NODE_SHUTDOWN):
-			// TODO shutdown
-			break;
+		shutdown_routine();	// in shutdown state, CC will continue MC heartbeat
+		// Shutdown all active timers
+		for(uint8_t i = 0 ; i < MAX_NODE_NUM;i++){
+			xTimerStop(nodeTmrHandle[i], portMAX_DELAY);
+		}
+		break;
 
 	case(NODE_START):
-			// TODO start
-			break;
+		// first send to all main nodes RESET command
+		resetCmd.isExt = 0;
+		resetCmd.isRemote = 0;
+		resetCmd.core.dlc = CMD_DLC;
+		for(uint8_t i = 0 ; i < MAX_NODE_NUM;i++){
+			if(nodeTable[i].nodeFirmwareVersion != SW_Sentinel){
+				resetCmd.core.id = i + p2pOffset;
+				resetCmd.core.Data[0] = NODE_RESET;
+				xQueueSend(mainCanTxBufHandle, &resetCmd, portMAX_DELAY);
+			}
+		}
+		// Reset the badNodes queue since a fresh reset has been issued
+		xQueueReset(badNodesHandle);
+		break;
+
 	default:
 		break;
 	}
+	taskEXIT_CRITICAL();
 }
 
 // Handler for node HB timeout
@@ -218,7 +301,7 @@ void motCanRxCallback(){
 		}
 	}
 
-	// TODO: Any data to additional application layer tasks should be buffered with Queues
+	// XXX: Any data to additional application layer tasks should be buffered with Queues
 	xQueueSend(mainCanTxBufHandle, &newCore, portMAX_DELAY);	// Push the data onto main CAN for radio
 }
 
@@ -227,8 +310,19 @@ void motCanRxCallback(){
  * Will ultimately destroy the task running it
  */
 void resetNode(resetParams * passed){
-	if(passed->attempts == 0){
-		// TODO: Send RESET command to node
+	if(passed->attempts >= 0){
+		static Can_frame_t newFrame;
+		newFrame.isExt = 0;
+		newFrame.isRemote = 0;
+		newFrame.core.id = passed->nodeID + p2pOffset;
+		newFrame.core.dlc = CMD_DLC;
+		if(passed->attempts > 0){
+			newFrame.core.Data[0] = NODE_RESET;	// First attempt - soft reset
+		}
+		else{
+			newFrame.core.Data[0] = NODE_HRESET;	// Second attempt and beyond - hard reset
+		}
+		xQueueSend(mainCanTxBufHandle, &newFrame, portMAX_DELAY);
 		osDelayUntil(&(passed->ticks), HB_Interval);
 		if((nodeTable[passed->nodeID].nodeConnectionState & 0x07) == UNRELIABLE){
 			passed->attempts = passed->attempts+1;
@@ -299,9 +393,15 @@ int main(void)
   Can_begin();
   Can_setRxCallback(motCanRxCallback);
   setupNodeTable();
-  nodeTable[cc_nodeID].nodeStatusWord |= ACTIVE;
+  nodeTable[cc_nodeID].nodeStatusWord |= ACTIVE;		// Set initial status to ACTIVE
 
-  // TODO: configure bxCAN to receive extended IDs from Mitsuba controller
+  // Set up CAN filter banks
+  Can_addMaskedFilterStd(swOffset,0xFF0,0); // Filter: Status word group (ignore nodeID)
+  Can_addMaskedFilterStd(fwOffset,0xFF0,0); // Filter: Firmware version group (ignore nodeID)
+
+  Can_addMaskedFilterExt(mitsubaFr0,0xFFFFFF0F,0);	// Mitsuba Frame 0
+  Can_addMaskedFilterExt(mitsubaFr1,0xFFFFFF0F,0);	// Mitsuba Frame 1
+  Can_addMaskedFilterExt(mitsubaFr2,0xFFFFFF0F,0);	// Mitsuba Frame 2
   /* USER CODE END 2 */
 
   /* Create the mutex(es) */
@@ -766,102 +866,108 @@ void doProcessCan(void const * argument)
 	xQueueReceive(mainCanRxBufHandle, &newFrame, portMAX_DELAY);
 	uint8_t canID = newFrame.core.id;	// canID container
 	uint8_t nodeID = canID & 0x00F;		// nodeID container
-	uint32_t temp_data;					// Temporary data container
-	for(int i=0; i<4; i++){
-		temp_data |= (newFrame.core.Data[i] << (8*(3-i)));
-	}
+
 	// CAN ID group processing
 	if(canID == p2pOffset){
 		// CAN ID is a P2P ID -> command
 		executeCommand((nodeCommands)newFrame.core.Data);	// Byte length command, no need to put into uint32_t form
 	}
-	else if ((canID & 0xFF0) == swOffset){
-		// Check if node is defined in nodeTable
-		if(nodeTable[nodeID].nodeFirmwareVersion == SW_Sentinel)
-		{
-			// Node not in registered domain; Send SHUTDOWN command to node
+
+	if((nodeTable[cc_nodeID].nodeStatusWord & 0x07) == ACTIVE){
+		// Only respond if node is active
+		uint32_t temp_data = 0;				// Temporary data container
+		for(int i=0; i<4; i++){
+			temp_data |= (newFrame.core.Data[i] << (8*(3-i)));
+		}
+
+		if ((canID & 0xFF0) == swOffset){
+			// Check if node is defined in nodeTable
+			if(nodeTable[nodeID].nodeFirmwareVersion == SW_Sentinel)
+			{
+				// Node not in registered domain; Send SHUTDOWN command to node
+				static Can_frame_t shutdownCMD;
+				shutdownCMD.isExt = 0;
+				shutdownCMD.isRemote = 0;
+				shutdownCMD.core.id = nodeID + p2pOffset;
+				shutdownCMD.core.dlc = CMD_DLC;
+				shutdownCMD.core.Data[0] = NODE_SHUTDOWN;
+				xQueueSend(mainCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
+				break;
+			}
+			// CAN ID is a status word address
+			if(nodeTable[nodeID].nodeConnectionState == CONNECTED){
+				xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
+				nodeTable[nodeID].nodeStatusWord = temp_data;
+				xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
+				if((temp_data & 0x07) == ACTIVE){
+					xTimerReset(nodeTmrHandle[nodeID], portMAX_DELAY);	// Reset the node heartbeat count down
+				}
+				else if (((temp_data & 0x07) == SHUTDOWN)){
+					xTimerStop(nodeTmrHandle[nodeID], portMAX_DELAY);	// Stop the heartbeat timer when the node is in SHUTDOWN state
+				}
+			}
+			else if(nodeTable[nodeID].nodeConnectionState == CONNECTING){
+				if((temp_data & 0x07) == ACTIVE){
+					xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
+					nodeTable[nodeID].nodeStatusWord = temp_data;
+					nodeTable[nodeID].nodeConnectionState = CONNECTED;
+					xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
+
+					if(nodeID == mc_nodeID){
+						xTimerReset(HBTmrHandle, portMAX_DELAY);		// Start the timer for the motor heartbeat
+					}
+				}
+				// If node not in ACTIVE state, will continue waiting until HB timeout and the node is flagged as unreliable
+				xTimerReset(nodeTmrHandle[nodeID], portMAX_DELAY);	// Start the timer for the new node
+			}
+			else{
+				xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
+				nodeTable[nodeID].nodeStatusWord &= 0xFFFFFFF8;
+				nodeTable[nodeID].nodeStatusWord |= UNRELIABLE;
+				xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
+				xQueueSend(badNodesHandle, &nodeID, portMAX_DELAY);
+			}
+		}
+		else if((canID & 0xFF0) == fwOffset){
+
 			static Can_frame_t shutdownCMD;
 			shutdownCMD.isExt = 0;
 			shutdownCMD.isRemote = 0;
 			shutdownCMD.core.id = nodeID + p2pOffset;
 			shutdownCMD.core.dlc = CMD_DLC;
-			shutdownCMD.core.Data[0] = SHUTDOWN;
-			xQueueSend(mainCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
-			break;
-		}
-		// CAN ID is a status word address
-		if(nodeTable[nodeID].nodeConnectionState == CONNECTED){
-			xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
-			nodeTable[nodeID].nodeStatusWord = temp_data;
-			xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
-			if((temp_data & 0x07) == ACTIVE){
-				xTimerReset(nodeTmrHandle[nodeID], portMAX_DELAY);	// Reset the node heartbeat count down
+
+			// Check if node is in table
+			if(nodeTable[nodeID].nodeFirmwareVersion == SW_Sentinel)
+			{
+				// Node not in registered domain; Send SHUTDOWN command to node
+				shutdownCMD.core.Data[0] = NODE_SHUTDOWN;
 			}
-			else if (((temp_data & 0x07) == SHUTDOWN)){
-				xTimerStop(nodeTmrHandle[nodeID], portMAX_DELAY);	// Stop the heartbeat timer when the node is in SHUTDOWN state
-			}
-		}
-		else if(nodeTable[nodeID].nodeConnectionState == CONNECTING){
-			if((temp_data & 0x07) == ACTIVE){
+			else if(temp_data == nodeTable[nodeID].nodeFirmwareVersion){
+				// Firmware version accepted
+				shutdownCMD.core.Data[0] = CC_ACK;
 				xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
-				nodeTable[nodeID].nodeStatusWord = temp_data;
-				nodeTable[nodeID].nodeConnectionState = CONNECTED;
+				nodeTable[nodeID].nodeStatusWord &= 0xFFFFFFF8;
+				nodeTable[nodeID].nodeStatusWord |= CONNECTING;
 				xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
-
-				if(nodeID == mc_nodeID){
-					xTimerReset(HBTmrHandle, portMAX_DELAY);		// Start the timer for the motor heartbeat
-				}
 			}
-			// If node not in ACTIVE state, will continue waiting until HB timeout and the node is flagged as unreliable
-			xTimerReset(nodeTmrHandle[nodeID], portMAX_DELAY);	// Start the timer for the new node
-		}
-		else{
-			xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
-			nodeTable[nodeID].nodeStatusWord &= 0xFFFFFFF0;
-			nodeTable[nodeID].nodeStatusWord |= UNRELIABLE;
-			xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
-			xQueueSend(badNodesHandle, &nodeID, portMAX_DELAY);
-		}
-	}
-	else if((canID & 0xFF0) == fwOffset){
-
-		static Can_frame_t shutdownCMD;
-		shutdownCMD.isExt = 0;
-		shutdownCMD.isRemote = 0;
-		shutdownCMD.core.id = nodeID + p2pOffset;
-		shutdownCMD.core.dlc = CMD_DLC;
-
-		// Check if node is in table
-		if(nodeTable[nodeID].nodeFirmwareVersion == SW_Sentinel)
-		{
-			// Node not in registered domain; Send SHUTDOWN command to node
-			shutdownCMD.core.Data[0] = SHUTDOWN;
-		}
-		else if(temp_data == nodeTable[nodeID].nodeFirmwareVersion){
-			// Firmware version accepted
-			shutdownCMD.core.Data[0] = CC_ACK;
-			xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
-			nodeTable[nodeID].nodeStatusWord &= 0xFFFFFFF0;
-			nodeTable[nodeID].nodeStatusWord |= CONNECTING;
-			xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
+			else {
+				// Incorrect firmware version
+				shutdownCMD.core.Data[0] = CC_NACK;
+				xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
+				nodeTable[nodeID].nodeStatusWord &= 0xFFFFFFF8;
+				nodeTable[nodeID].nodeStatusWord |= DISCONNECTED;
+				xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
+			}
+			xQueueSend(mainCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
 		}
 		else {
-			// Incorrect firmware version
-			shutdownCMD.core.Data[0] = CC_NACK;
-			xSemaphoreTake(nodeEntryMtxHandle[nodeID],portMAX_DELAY);
-			nodeTable[nodeID].nodeStatusWord &= 0xFFFFFFF0;
-			nodeTable[nodeID].nodeStatusWord |= DISCONNECTED;
-			xSemaphoreGive(nodeEntryMtxHandle[nodeID]);
-		}
-		xQueueSend(mainCanTxBufHandle, &shutdownCMD, portMAX_DELAY);
-	}
-	else {
-		// Individual CAN ID Processing
-		switch(canID){
-			// Insert CAN IDs here
-			default:
-				// Ignore other incoming frames
-				break;
+			// Individual CAN ID Processing
+			switch(canID){
+				// Insert CAN IDs here
+				default:
+					// Ignore other incoming frames
+					break;
+			}
 		}
 	}
   }

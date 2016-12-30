@@ -44,6 +44,8 @@
 /* Includes ------------------------------------------------------------------*/
 #include "FreeRTOS.h"
 #include "task.h"
+#include "main.h"
+#include "../../CAN_ID.h"
 
 /* USER CODE BEGIN Includes */     
 
@@ -65,12 +67,16 @@
 void vApplicationStackOverflowHook(TaskHandle_t xTask, signed char *pcTaskName);
 void vApplicationMallocFailedHook(void);
 
+extern nodeEntry * nodeTable;
+
 /* USER CODE BEGIN 4 */
 __weak void vApplicationStackOverflowHook(TaskHandle_t xTask, signed char *pcTaskName)
 {
    /* Run time stack overflow checking is performed if
    configCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2. This hook function is
    called if a stack overflow is detected. */
+	nodeTable[cc_nodeID].nodeStatusWord &= 0xFFFFFFF0;
+	nodeTable[cc_nodeID].nodeStatusWord |= HARD_ERROR;
 }
 /* USER CODE END 4 */
 
@@ -87,6 +93,8 @@ __weak void vApplicationMallocFailedHook(void)
    FreeRTOSConfig.h, and the xPortGetFreeHeapSize() API function can be used
    to query the size of free heap space that remains (although it does not
    provide information on how the remaining heap might be fragmented). */
+	nodeTable[cc_nodeID].nodeStatusWord &= 0xFFFFFFF0;
+	nodeTable[cc_nodeID].nodeStatusWord |= HARD_ERROR;
 }
 /* USER CODE END 5 */
 
