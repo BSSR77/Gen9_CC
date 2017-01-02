@@ -314,7 +314,7 @@ static void enableInterrupts(uint8_t interrupts){
 
 static void init_cb(){
 	not_in_use = 0;
-	switch(cbparam){
+	switch(cbparam){ //steps to reset
 	case 1:
 		setOverflow(1); break; //enable overflow
 	case 2:
@@ -325,6 +325,8 @@ static void init_cb(){
 		setFilter(1, 0, 1); break;
 	case 5:
 		setFilter(6, 0, 0); break; //set mask: all pass-thru
+	//case 6:
+		/*TODO set operation modes*/
 	default:
 		not_in_use = 1;
 		cbparam = 0;
